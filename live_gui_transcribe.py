@@ -1,91 +1,118 @@
-import sounddevice as sd
-import numpy as np
 import tkinter as tk
 import threading
-import subprocess
-import sys
+import numpy as np
+import sounddevice as sd
 from faster_whisper import WhisperModel
+import pyttsx3
 
-# --- Settings ---
-LANG = "en"          # "fr" for French
-MODEL = "base"       # Options: tiny, base, small, medium, large
+
+# --- SETTINGS ---
+LANG = "en"          # or "fr"
+MODEL_SIZE = "base"  # tiny, base, small, medium, large
 FS = 16000           # Sampling rate
-DURATION = 5         # Duration of recording in seconds
+DURATION = 5         # Recording length (seconds)
 
-# --- Load Whisper model ---
+
+# --- LOAD WHISPER MODEL ---
 print("Loading Whisper model...")
-model = WhisperModel(MODEL, device="cpu")
+model = WhisperModel(MODEL_SIZE)
 print("Model loaded successfully.")
 
-# --- Tkinter GUI setup ---
+
+# --- RECORD AUDIO ---
+def record_audio(duration=DURATION, fs=FS):
+    print("Recording...")
+    audio = sd.rec(int(duration * fs), samplerate=fs, channels=1, dtype="float32")
+    sd.wait()
+    print("Recording finished.")
+    return np.squeeze(audio)
+
+
+# --- TRANSCRIBE AUDIO ---
+def transcribe_audio(audio):
+    print("Transcribing...")
+    segments, _ = model.transcribe(audio, beam_size=5, language=LANG)
+    text = " ".join([segment.text for segment in segments])
+    print("Transcription:", text)
+    return text
+
+
+# --- SPEAK TEXT ---
+def speak_text(text):
+    if not text:
+        return
+    engine = pyttsx3.init()
+    engine.setProperty("rate", 170)
+    engine.setProperty("volume", 1.0)
+    engine.say(text)
+    engine.runAndWait()
+    engine.stop()
+
+
+# --- GUI SETUP ---
 root = tk.Tk()
-root.title("Voice Transcriber and Speaker")
+root.title("Voice Transcriber")
 root.geometry("800x500")
 root.configure(bg="#f8f8f8")
 
-title = tk.Label(root, text=f"Voice Transcriber ({LANG.upper()})",
-                 font=("Arial", 18, "bold"), bg="#f8f8f8")
+title = tk.Label(
+    root,
+    text=f"Voice Transcriber ({LANG.upper()})",
+    font=("Arial", 18, "bold"),
+    bg="#f8f8f8"
+)
 title.pack(pady=10)
 
-text_box = tk.Text(root, wrap=tk.WORD, font=("Arial", 14),
-                   height=15, bg="white")
+text_box = tk.Text(
+    root,
+    wrap=tk.WORD,
+    font=("Arial", 14),
+    height=15,
+    bg="white"
+)
 text_box.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
 
-status_label = tk.Label(root, text="Status: Idle",
-                        font=("Arial", 12), bg="#f8f8f8")
+status_label = tk.Label(
+    root,
+    text="Status: Idle",
+    font=("Arial", 12),
+    bg="#f8f8f8"
+)
 status_label.pack(pady=5)
 
-# --- Record + Transcribe + Speak ---
+
+# --- MAIN FUNCTION ---
 def record_and_transcribe():
     status_label.config(text="Status: Recording...")
     text_box.delete(1.0, tk.END)
-
-    # Record audio
-    audio = sd.rec(int(DURATION * FS), samplerate=FS, channels=1, dtype=np.float32)
-    sd.wait()
+    audio = record_audio()
 
     status_label.config(text="Status: Transcribing...")
-
-    # Transcribe using Whisper
-    audio = audio.flatten()
-    segments, _ = model.transcribe(audio, language=LANG)
-
-    result_text = ""
-    for seg in segments:
-        result_text += seg.text.strip() + " "
+    result_text = transcribe_audio(audio)
 
     if result_text:
         text_box.insert(tk.END, result_text)
-        text_box.see(tk.END)
+        text_box.update_idletasks()
         status_label.config(text="Status: Speaking...")
-
-        # Speak text using a new process each time
-        try:
-            subprocess.run(
-                [sys.executable, "tts_once.py"],
-                input=result_text,
-                text=True,
-                check=False
-            )
-        except Exception as e:
-            print("Speech error:", e)
+        speak_text(result_text)
 
     status_label.config(text="Status: Done")
 
-# --- Start button ---
+
 def start_transcription():
     threading.Thread(target=record_and_transcribe, daemon=True).start()
 
-# --- Button design ---
-button_frame = tk.Frame(root, bg="#f8f8f8")
-button_frame.pack(pady=(0, 10))
 
-start_button = tk.Button(root,
-                         text="Start",
-                         font=("Arial", 16, "bold"),  # Larger text
-                         command=start_transcription,
-                         bg="#4CAF50", fg="white",
-                         width=10, height=3)  # size
-start_button.pack(ipady=10)
+# --- BUTTON ---
+start_button = tk.Button(
+    root,
+    text="Start",
+    font=("Arial", 18, "bold"),
+    command=start_transcription,
+    bg="#4CAF50",
+    fg="white",
+    width=10,
+)
+start_button.pack(pady=20, ipady=15)
 
 root.mainloop()
