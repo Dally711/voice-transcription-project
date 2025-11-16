@@ -1,0 +1,11 @@
+faster-whisper>=0.10
+sounddevice>=0.4.6
+numpy>=1.24
+pyttsx3>=2.90
+scipy>=1.11
+torch>=2.1
+librosa>=0.10
+soundfile>=0.12
+pydub>=0.25
+tensorflow>=2.13
+tensorflow_hub>=0.15
