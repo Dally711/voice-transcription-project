@@ -3,3 +3,5 @@ __pycache__/
 *.wav
 *.pyc
 .DS_Store
+dist/
+build/
