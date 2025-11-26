@@ -5,6 +5,7 @@ from tkinter import messagebox, simpledialog
 import threading
 
 import json
+import io
 
 import os
 
@@ -13,10 +14,17 @@ import numpy as np
 import sounddevice as sd
 
 from faster_whisper import WhisperModel
+try:
+    import requests  # type: ignore
+except Exception:
+    requests = None
+import re
+from scipy.io.wavfile import write as wav_write
 
 import pyttsx3
 
 from pathlib import Path
+from typing import Optional
 import librosa
 
 
@@ -73,6 +81,10 @@ MODEL_SIZE = "base"  # tiny, base, small, medium, large
 FS = 16000           # Sampling rate
 
 DURATION = 5         # Recording length (seconds)
+USE_DEEPGRAM = False  # set False to force local Whisper
+PERSONALIZED_MODE = True  # bias output to saved commands only when True
+USE_OPENAI_WHISPER = True  # prefer OpenAI Whisper API if key is set
+OPENAI_MODEL = "whisper-1"
 
 
 
@@ -211,15 +223,52 @@ def record_audio(stop_event, duration=DURATION, fs=FS):
 # --- TRANSCRIBE AUDIO ---
 
 def transcribe_audio(audio):
+    if USE_OPENAI_WHISPER and requests is not None:
+        if not os.getenv("OPENAI_API_KEY"):
+            print("OpenAI Whisper skipped: OPENAI_API_KEY not set.")
+        else:
+            oa_text = transcribe_with_openai(audio)
+            if oa_text:
+                print("Using OpenAI Whisper API for transcription.")
+                return sanitize_transcript(oa_text)
+            else:
+                print("OpenAI Whisper returned empty; falling back.")
+    if USE_DEEPGRAM and requests is not None and os.getenv("DEEPGRAM_API_KEY"):
+        dg_text = transcribe_with_deepgram(audio)
+        if dg_text:
+            return sanitize_transcript(dg_text)
 
-    print("Transcribing...")
+    prompt = ""
+    if command_recognizer and command_recognizer.command_names:
+        prompt = "Commands: " + ", ".join(command_recognizer.command_names)
 
-    segments, _ = model.transcribe(audio, beam_size=5, language=LANG)
+    def build_transcript(segments):
+        lines = []
+        prev_norm = ""
+        for seg in segments:
+            text = seg.text.strip()
+            if not text:
+                continue
+            norm = text.lower().strip(" ,.")
+            # Skip exact or near-duplicate consecutive phrases.
+            if norm == prev_norm:
+                continue
+            prev_norm = norm
+            lines.append(text)
+        return " ".join(lines)
 
-    text = " ".join([segment.text for segment in segments])
-
-    print("Transcription:", text)
-
+    segments, _ = model.transcribe(
+        audio,
+        beam_size=5,
+        temperature=0.0,
+        condition_on_previous_text=False,
+        compression_ratio_threshold=1.25,
+        vad_filter=True,
+        language=LANG,
+        initial_prompt=prompt,   # <-- bias toward your phrases
+    )
+    text = build_transcript(segments)
+    text = sanitize_transcript(text)
     return text
 
 
@@ -335,11 +384,17 @@ status_label.pack(pady=(10, 5))
 
 
 buttons_container = tk.Frame(control_frame, bg="#f8f8f8")
-
 buttons_container.pack()
 
-
-
+personalized_var = tk.BooleanVar(value=PERSONALIZED_MODE)
+personalized_toggle = tk.Checkbutton(
+    control_frame,
+    text="Personalized (commands only)",
+    variable=personalized_var,
+    bg="#f8f8f8",
+    font=("Arial", 12),
+)
+personalized_toggle.pack(pady=(0, 5))
 
 
 # --- TEXT FONT CONTROL ---
@@ -376,6 +431,177 @@ def apply_saved_corrections(text_value):
         return text_value
     key = text_value.strip()
     return corrections.get(key, text_value)
+
+
+def dedupe_repetitions(text_value: str, max_repeats: int = 1, max_window: int = 12) -> str:
+    """Collapse excessive repeated phrases (common Whisper hallucination)."""
+    if not isinstance(text_value, str):
+        return text_value
+    # Split on words but keep commas as separators to avoid merging sentences.
+    tokens = text_value.replace(",", " , ").split()
+    if len(tokens) < 4:
+        return text_value
+
+    result_tokens = []
+    i = 0
+    while i < len(tokens):
+        window_size = min(max_window, len(tokens) - i)
+        matched = False
+        for w in range(window_size, 1, -1):
+            chunk = tokens[i : i + w]
+            repeat = 1
+            while (
+                i + repeat * w + w <= len(tokens)
+                and tokens[i + repeat * w : i + (repeat + 1) * w] == chunk
+            ):
+                repeat += 1
+            if repeat > 1:
+                # Keep only a limited number of repeats to avoid runaway duplication.
+                result_tokens.extend(chunk * min(repeat, max_repeats))
+                i += repeat * w
+                matched = True
+                break
+        if not matched:
+            result_tokens.append(tokens[i])
+            i += 1
+    collapsed = " ".join(result_tokens).replace(" ,", ",")
+    return " ".join(collapsed.split())
+
+
+def sanitize_transcript(text_value: str) -> str:
+    """Stronger repetition clamp for upstream transcripts."""
+    if not isinstance(text_value, str):
+        return text_value
+    text_value = text_value.strip()
+    if not text_value:
+        return text_value
+
+    # Remove immediate single-word runs (word word word -> word).
+    tokens = text_value.replace(",", " , ").split()
+    collapsed_tokens = []
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        j = i + 1
+        while j < len(tokens) and tokens[j] == t:
+            j += 1
+        collapsed_tokens.append(t)
+        i = j
+    collapsed = " ".join(collapsed_tokens).replace(" ,", ",")
+
+    # Deduplicate clauses split by punctuation; keep first occurrence.
+    clauses = [c.strip() for c in re.split(r"[.;,]+", collapsed) if c.strip()]
+    seen = set()
+    unique_clauses = []
+    for c in clauses:
+        key = c.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_clauses.append(c)
+    return ", ".join(unique_clauses)
+
+
+def _to_pcm16(audio: np.ndarray) -> bytes:
+    """Convert float32 mono audio (-1..1) to 16-bit PCM bytes."""
+    audio = np.asarray(audio, dtype=np.float32)
+    if audio.size == 0:
+        return b""
+    clipped = np.clip(audio, -1.0, 1.0)
+    ints = (clipped * 32767.0).astype(np.int16)
+    return ints.tobytes()
+
+
+def transcribe_with_deepgram(audio: np.ndarray) -> str:
+    """Send audio to Deepgram; return transcript or '' on failure."""
+    if requests is None:
+        return ""
+    api_key = os.getenv("DEEPGRAM_API_KEY")
+    if not api_key:
+        return ""
+    keywords = []
+    if command_recognizer and command_recognizer.command_names:
+        keywords = list(command_recognizer.command_names)
+    try:
+        pcm = _to_pcm16(audio)
+        if not pcm:
+            return ""
+        resp = requests.post(
+            "https://api.deepgram.com/v1/listen",
+            params={
+                "model": "nova-2-general",
+                "language": LANG,
+                "encoding": "linear16",
+                "sample_rate": FS,
+                "channels": 1,
+                "punctuate": "true",
+                "smart_format": "true",
+                "paragraphs": "false",
+                "utterances": "false",
+                "no_delay": "true",
+                "diarize": "false",
+                # Keyword boosting to favor your commands (mild boost).
+                "keywords": ",".join(keywords) if keywords else None,
+            },
+            headers={
+                "Authorization": f"Token {api_key}",
+                "Content-Type": "application/octet-stream",
+            },
+            data=pcm,
+            timeout=20,
+        )
+        if not resp.ok:
+            print(f"Deepgram failed: {resp.status_code} {resp.text}")
+            return ""
+        data = resp.json()
+        alts = data.get("results", {}).get("channels", [{}])[0].get("alternatives", [])
+        if not alts:
+            return ""
+        return alts[0].get("transcript", "") or ""
+    except Exception as exc:
+        print(f"Deepgram failed: {exc}")
+        return ""
+
+
+def transcribe_with_openai(audio: np.ndarray) -> str:
+    """Send audio to OpenAI Whisper API; return transcript or '' on failure."""
+    if requests is None:
+        return ""
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return ""
+    prompt = ""
+    try:
+        if command_recognizer and command_recognizer.command_names:
+            prompt = "Commands: " + ", ".join(command_recognizer.command_names)
+    except Exception:
+        prompt = ""
+    try:
+        pcm = np.asarray(audio, dtype=np.float32)
+        if pcm.size == 0:
+            return ""
+        buf = io.BytesIO()
+        wav_write(buf, FS, (np.clip(pcm, -1.0, 1.0) * 32767).astype(np.int16))
+        buf.seek(0)
+        files = {"file": ("audio.wav", buf, "audio/wav")}
+        data = {"model": OPENAI_MODEL, "language": LANG}
+        if prompt:
+            data["prompt"] = prompt
+        resp = requests.post(
+            "https://api.openai.com/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            data=data,
+            files=files,
+            timeout=30,
+        )
+        if not resp.ok:
+            print(f"OpenAI Whisper failed: {resp.status_code} {resp.text}")
+            return ""
+        out = resp.json()
+        return out.get("text", "") or ""
+    except Exception as exc:
+        print(f"OpenAI Whisper failed: {exc}")
+        return ""
 
 
 def extract_training_features(audio: np.ndarray, sr: int = FS):
@@ -467,6 +693,15 @@ def summarize_command_matches(matches):
 
         )
 
+    text_fuzzy = matches.get("text_fuzzy")
+    if text_fuzzy:
+
+        lines.append(
+
+            f"Fuzzy transcript match: {text_fuzzy['command']} (confidence {text_fuzzy['score']:.2f})"
+
+        )
+
 
 
     dtw_hit = matches.get("dtw")
@@ -510,6 +745,25 @@ def summarize_command_matches(matches):
 
 
     return "Command hints:\n" + "\n".join(f"- {line}" for line in lines)
+
+
+def select_best_command(matches: Optional[dict]) -> Optional[str]:
+    """Pick a single best command from transcript/DTW/YAMNet."""
+    if not matches:
+        return None
+    # Priority: DTW > transcript > YAMNet with confidence gating.
+    if matches.get("dtw"):
+        score = matches["dtw"].get("score", 0.0)
+        margin = matches["dtw"].get("margin", 0.0)
+        if score >= 0.65 and margin >= 0.06:
+            return matches["dtw"]["command"]
+    if matches.get("transcript"):
+        return matches["transcript"]["command"]
+    if matches.get("text_fuzzy") and matches["text_fuzzy"].get("score", 0.0) >= 0.55:
+        return matches["text_fuzzy"]["command"]
+    if matches.get("yamnet"):
+        return matches["yamnet"]["command"]
+    return None
 
 
 
@@ -566,49 +820,42 @@ def record_and_transcribe():
         result_text = transcribe_audio(audio)
 
         result_text = apply_saved_corrections(result_text)
+        result_text = dedupe_repetitions(result_text)
 
 
 
+        matches = None
+        summary = None
+        if command_recognizer is not None:
+            try:
+                matches = command_recognizer.match(audio, result_text)
+            except Exception as exc:
+                print(f"Command recognizer error: {exc}")
+                matches = None
+            summary = summarize_command_matches(matches)
+
+        if personalized_var.get():
+            best_cmd = select_best_command(matches)
+            if best_cmd:
+                result_text = best_cmd
+            else:
+                result_text = ""
+
+        text_box.delete(1.0, tk.END)
         if result_text:
-
             apply_dynamic_font(result_text)
-
             text_box.insert(tk.END, f"You said:\n{result_text}\n\n")
-
+            if summary:
+                text_box.insert(tk.END, f"{summary}\n\n")
             text_box.update_idletasks()
 
-
-
-            if command_recognizer is not None:
-
-                try:
-
-                    matches = command_recognizer.match(audio, result_text)
-
-                except Exception as exc:
-
-                    print(f"Command recognizer error: {exc}")
-
-                    matches = None
-
-
-
-                summary = summarize_command_matches(matches)
-
-                if summary:
-
-                    text_box.insert(tk.END, f"{summary}\n\n")
-
-                    text_box.update_idletasks()
-
-
-
             status_label.config(text="Status: Speaking...")
-
             speak_text(result_text)
-
             last_transcript_text = result_text
-
+        else:
+            placeholder = "[No command detected]" if personalized_var.get() else "[No transcription]"
+            text_box.insert(tk.END, f"You said:\n{placeholder}\n\n")
+            last_transcript_text = ""
 
 
         status_label.config(text="Status: Done")
@@ -686,7 +933,7 @@ def stop_recording():
 
 def mark_incorrect_transcription():
 
-    global corrections, last_transcript_text
+    global corrections, last_transcript_text, last_audio_capture
 
     current_text = last_transcript_text.strip()
 
@@ -734,7 +981,27 @@ def mark_incorrect_transcription():
 
     text_box.insert(tk.END, correction)
 
-    status_label.config(text="Status: Correction saved.")
+    status = "Status: Correction saved."
+
+    # Also save the current audio as a DTW template under the corrected label.
+    audio_saved = False
+    if last_audio_capture is not None and getattr(last_audio_capture, "size", 0) > 0:
+        try:
+            features = extract_training_features(last_audio_capture)
+            data = load_commands_data()
+            entry = data.setdefault(correction, {})
+            entry.setdefault("samples", [])
+            entry["samples"].append(features)
+            save_commands_data(data)
+            audio_saved = True
+            status = f"Status: Correction saved; sample added to '{correction}'."
+            if save_button is not None:
+                save_button.config(state=tk.DISABLED)
+            reload_command_recognizer()
+        except Exception as exc:
+            print(f"Failed to save corrected sample: {exc}")
+
+    status_label.config(text=status)
 
     not_button.config(state=tk.NORMAL)
 
@@ -840,4 +1107,5 @@ save_button.pack(side=tk.LEFT, padx=10, ipadx=20, ipady=15)
 
 
 root.mainloop()
+
 
